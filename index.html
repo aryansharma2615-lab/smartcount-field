@@ -5,10 +5,10 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="SmartCount">
-<meta name="theme-color" content="#0d1012">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon.svg">
+<meta name="apple-mobile-web-app-title" content="SmartCount">
+<meta name="theme-color" content="#0d1012">
 <title>SmartCount</title>
 <!--
   SMART COUNT — STANDALONE PHONE COUNTER
@@ -123,12 +123,15 @@ details summary{cursor:pointer;font-size:13px;color:var(--muted);padding:6px 0}
   </div>
   <div class="row">
     <button id="zoom" style="flex:1 1 70px">Zoom 1&times;</button>
-    <button id="tagMode" aria-pressed="true" style="flex:2 1 120px">Tags on</button>
-    <button id="shot" style="flex:1 1 90px">Photo</button>
+    <button id="tagMode" aria-pressed="true" style="flex:2 1 110px">Tags on</button>
+    <button id="shot" style="flex:1 1 80px">Photo</button>
+    <button id="reset" style="flex:1 1 70px">Re-lock</button>
   </div>
 
   <div class="chips">
     <span class="chip" id="cTrust">trust —</span>
+    <span class="chip" id="cTrack">tracks —</span>
+    <span class="chip" id="cMotion">still</span>
     <span class="chip" id="cRate">—</span>
     <span class="chip" id="cW">cyl —</span>
   </div>
@@ -591,6 +594,223 @@ function countCylinders(img, W, H){
 }
 
 /* ===================================================================
+   TEMPORAL LAYER — tracking, motion and scene lock.
+   Phone-only; `layers.py` has its own Tracker for the Mac path. Nothing
+   below changes a single-frame result, so the 9/9 JS<->Python parity on
+   countCylinders() still holds.
+
+   Why this exists: a single frame of a cluttered room will sometimes
+   score as a rack. Pointed at a classroom the detector found "cylinders"
+   in desk legs and window frames, lost them, found them again — a number
+   appearing and vanishing. One frame can be fooled; eight consecutive
+   frames that agree on the same cylinders in the same places cannot be,
+   because clutter is not periodic and does not hold still.
+
+   So a count is never shown straight off a frame. A cylinder must be seen
+   for minHits frames before it is counted, the row must be geometrically
+   regular, the phone must be still, and the total must hold steady for
+   lockFrames before the big number appears at all. Until then the display
+   says it is looking, which is the truth.
+   =================================================================== */
+const TRK = {
+  minHits: 3,        // frames a cylinder must survive before it is counted
+  maxMisses: 6,      // frames a track may vanish for before it is dropped
+  coastMisses: 2,    // frames it keeps being counted while briefly occluded
+  matchFrac: 0.60,   // association radius, as a fraction of cylinder width
+  mergeFrac: 0.45,   // two tracks closer than this are the same cylinder
+  voteWindow: 12,    // tag-state votes kept per track
+  lockFrames: 4,     // agreeing frames needed to commit a number
+  loseFrames: 10,    // bad frames before the number is only "held"
+  dropFrames: 30,    // bad frames before the held number is discarded
+  motionGate: 9.0,   // mean grey change per pixel that counts as "moving"
+  pitchCV: 0.30,     // gap irregularity at which a row stops being a rack
+  countWindow: 9,    // frames in the count-stability vote
+  countShare: 0.60,  // share of those frames that must agree
+  maxBandFill: 0.90, // a band filling the frame means no rack top was found
+  minScore: 0.50     // rack score needed to commit a number
+};
+
+let TRACKS = [], nextTid = 1, prevSmall = null;
+
+function resetTracking(why){
+  TRACKS = []; nextTid = 1; prevSmall = null;
+  SCENE.mode = 'searching'; SCENE.good = 0; SCENE.bad = 0;
+  SCENE.counts = []; SCENE.commit = null; SCENE.score = 0;
+  if(why) setMsg(why);
+}
+
+/* How much the frame changed. A pan or a hand wobble moves every pixel, so a
+   coarse mean absolute difference separates "held still" from "waving it
+   around" for almost no cost, and tracking is only honest when still. */
+function sceneMotion(img, W, H){
+  const step = 8, d = img.data;
+  const cols = Math.ceil(W/step), rows = Math.ceil(H/step);
+  const buf = new Float32Array(cols*rows);
+  let i = 0;
+  for(let y=0; y<H; y+=step) for(let x=0; x<W; x+=step){
+    const p = (y*W+x)*4;
+    buf[i++] = d[p]*0.299 + d[p+1]*0.587 + d[p+2]*0.114;
+  }
+  let m = 0;
+  if(prevSmall && prevSmall.length === i){
+    for(let k=0;k<i;k++) m += Math.abs(buf[k]-prevSmall[k]);
+    m /= i || 1;
+  } else m = 999;                       // first frame: assume moving
+  prevSmall = buf;
+  return m;
+}
+
+/* A rack is periodic. Clutter is not. Measured with a MAD so one missing
+   bottle (a double gap) does not condemn the whole row. */
+function pitchRegularity(xs){
+  if(xs.length < 3) return 0.6;         // cannot judge periodicity; stay cautious
+  const g = [];
+  for(let i=1;i<xs.length;i++) g.push(xs[i]-xs[i-1]);
+  const m = median(g);
+  if(m <= 0) return 0;
+  const cv = median(g.map(x=>Math.abs(x-m)))/m;
+  return Math.max(0, Math.min(1, 1 - cv/TRK.pitchCV));
+}
+
+/* A track's state is the majority of what it has been seen as, not what this
+   frame happened to say — one bad glare frame no longer flips a tile. A real
+   state has to beat "unsure" outright. */
+function voteState(votes){
+  const c = {full:0, empty:0, in_use:0, unsure:0};
+  for(const s of votes) c[s] = (c[s]||0) + 1;
+  let best = 'unsure', n = -1;
+  for(const k of ['full','in_use','empty']) if(c[k] > n){ best = k; n = c[k]; }
+  if(n <= c.unsure || n < Math.ceil(votes.length*0.4))
+    return {state:'unsure', share: votes.length ? c.unsure/votes.length : 1};
+  return {state:best, share: n/votes.length};
+}
+
+function modeOf(arr){
+  const c = new Map();
+  for(const x of arr) c.set(x, (c.get(x)||0)+1);
+  let best = 0, n = 0;
+  for(const [k,v] of c) if(v > n){ best = k; n = v; }
+  return {value:best, share: arr.length ? n/arr.length : 0};
+}
+
+/* Greedy nearest-neighbour association, closest pairs first. Cylinders in a
+   rack are a 1-D problem — they only move along x — so this is both cheaper
+   and steadier than IoU over boxes. */
+function updateTracks(res, W, moving){
+  const width = Math.max(3, CFG.cylinderWidthFrac*W);
+  const radius = width * TRK.matchFrac * (moving ? 2.2 : 1);
+  const obs = res.cylinders.map(c => ({
+    x:(c.box.x0+c.box.x1)/2, w:c.box.x1-c.box.x0, c
+  }));
+
+  const pairs = [];
+  for(let ti=0; ti<TRACKS.length; ti++)
+    for(let oi=0; oi<obs.length; oi++){
+      const d = Math.abs(TRACKS[ti].x - obs[oi].x);
+      if(d <= radius) pairs.push([d, ti, oi]);
+    }
+  pairs.sort((a,b)=>a[0]-b[0]);
+
+  const tTaken = new Set(), oTaken = new Set();
+  for(const [, ti, oi] of pairs){
+    if(tTaken.has(ti) || oTaken.has(oi)) continue;
+    tTaken.add(ti); oTaken.add(oi);
+    const t = TRACKS[ti], o = obs[oi];
+    t.x  = t.x*0.65 + o.x*0.35;         // smoothed, so the boxes stop jittering
+    t.w  = t.w*0.80 + o.w*0.20;
+    t.y0 = t.y0*0.70 + o.c.box.y0*0.30;
+    t.y1 = t.y1*0.70 + o.c.box.y1*0.30;
+    t.hits++; t.misses = 0; t.age++;
+    t.votes.push(o.c.state);
+    if(t.votes.length > TRK.voteWindow) t.votes.shift();
+    if(o.c.tag) t.tag = o.c.tag;
+    t.conf = t.conf*0.7 + o.c.conf*0.3;
+    if(t.hits >= TRK.minHits) t.confirmed = true;
+  }
+  for(let ti=0; ti<TRACKS.length; ti++)
+    if(!tTaken.has(ti)){ TRACKS[ti].misses++; TRACKS[ti].age++; }
+  for(let oi=0; oi<obs.length; oi++){
+    if(oTaken.has(oi)) continue;
+    const o = obs[oi];
+    TRACKS.push({id:nextTid++, x:o.x, w:o.w, y0:o.c.box.y0, y1:o.c.box.y1,
+                 hits:1, misses:0, age:1, votes:[o.c.state],
+                 tag:o.c.tag, conf:o.c.conf, confirmed:false});
+  }
+
+  TRACKS = TRACKS.filter(t => t.misses <= TRK.maxMisses);
+  TRACKS.sort((a,b)=>a.x-b.x);
+  const merged = [];
+  for(const t of TRACKS){
+    const prev = merged[merged.length-1];
+    if(prev && Math.abs(prev.x - t.x) < width*TRK.mergeFrac){
+      if(t.hits > prev.hits) merged[merged.length-1] = t;   // keep the better-seen one
+    } else merged.push(t);
+  }
+  TRACKS = merged;
+  return TRACKS.filter(t => t.confirmed && t.misses <= TRK.coastMisses);
+}
+
+const SCENE = {mode:'idle', good:0, bad:0, counts:[], commit:null,
+               score:0, motion:0, reg:1, fill:1, blocker:''};
+
+/* The lock is asymmetric on purpose: four good frames to show a number, ten
+   bad ones to stop showing it, thirty to forget it. Flicker in either
+   direction is what made the old build look stupid. */
+function updateScene(res, live, moving, H){
+  const xs = live.map(t=>t.x);
+  SCENE.reg = pitchRegularity(xs);
+  SCENE.score = +(res.rackConfidence * (0.35 + 0.65*SCENE.reg)).toFixed(3);
+  SCENE.motion = moving;
+
+  /* THE GATE THAT KILLED THE PHANTOM COUNTS. A rack has a top: the band
+     detector finds the edge where cylinder shoulders meet the wall, and the
+     band comes out around two thirds of the frame. When there is no rack
+     there is no such edge, the band falls back to the whole frame, and
+     bandFill goes to 1.0 — measured 0.95-1.00 on every non-rack fixture
+     (ceilings, rooflines, a plain classroom wall) against 0.67-0.82 on real
+     and synthetic racks. Without this a plain gradient wall reported
+     EIGHTEEN cylinders at fit 1.00, which is precisely what happened in
+     class. The cost is that cylinders cropped off the top of the frame will
+     not lock either — so the UI asks for the top to be in shot, which also
+     makes the shape layer more accurate. */
+  const band = res.dbg.band || [0, H];
+  SCENE.fill = H ? (band[1]-band[0])/H : 1;
+  const framed = SCENE.fill <= TRK.maxBandFill;
+
+  SCENE.counts.push(live.length);
+  if(SCENE.counts.length > TRK.countWindow) SCENE.counts.shift();
+  const m = modeOf(SCENE.counts);
+  const steady = SCENE.counts.length >= TRK.lockFrames &&
+                 m.share >= TRK.countShare && m.value === live.length;
+  const ok = SCENE.score >= TRK.minScore && steady && framed &&
+             !moving && live.length > 0;
+  SCENE.blocker = moving ? 'moving' : !framed ? 'framing'
+                : SCENE.score < TRK.minScore ? 'scene'
+                : !live.length ? 'none' : !steady ? 'settling' : '';
+
+  if(ok){ SCENE.good++; SCENE.bad = 0; } else { SCENE.bad++; SCENE.good = 0; }
+
+  if(SCENE.mode === 'locked'){
+    if(SCENE.bad >= TRK.loseFrames) SCENE.mode = 'held';
+  } else if(SCENE.good >= TRK.lockFrames){
+    SCENE.mode = 'locked';
+  } else if(SCENE.mode === 'held'){
+    if(SCENE.bad >= TRK.dropFrames){ SCENE.mode = 'searching'; SCENE.commit = null; }
+  } else {
+    SCENE.mode = SCENE.good > 0 ? 'locking' : 'searching';
+  }
+
+  if(SCENE.mode === 'locked' && ok){
+    const all = {full:0, empty:0, in_use:0, unsure:0};
+    for(const t of live) all[voteState(t.votes).state]++;
+    SCENE.commit = {count:live.length, all, score:SCENE.score,
+                    trust:res.trust, at:Date.now(),
+                    width:CFG.cylinderWidthFrac};
+  }
+  return ok;
+}
+
+/* ===================================================================
    UI
    =================================================================== */
 const $ = id => document.getElementById(id);
@@ -628,6 +848,7 @@ $('start').onclick = async () => {
   $('dot').classList.add('on'); $('state').textContent='LIVE';
   $('start').textContent='Stop';
   setMsg('Camera '+(s.width||'?')+'×'+(s.height||'?')+' · all processing on this phone');
+  resetTracking();
   keepAwake();
   loop();
 };
@@ -635,9 +856,14 @@ function stopCam(){
   if(timer) cancelAnimationFrame(timer);
   if(stream) stream.getTracks().forEach(t=>t.stop());
   stream=null; timer=null;
+  resetTracking();
+  SCENE.mode='idle';
   $('dot').classList.remove('on'); $('state').textContent='STOPPED';
+  $('cnt').firstChild.nodeValue='—'; $('cnt').style.opacity='1';
+  $('warn').className='warn';
   $('start').textContent='Start camera';
 }
+$('reset').onclick = () => resetTracking('Tracking cleared — re-point at the rack.');
 let lock=null;
 async function keepAwake(){
   try{
@@ -653,6 +879,7 @@ async function keepAwake(){
 $('zoom').onclick = async () => {
   zoom = zoom>=3 ? 1 : zoom+1;
   $('zoom').textContent = 'Zoom '+zoom+'×';
+  resetTracking();            // the frame geometry just changed; old tracks are lies
   if(track){
     try{
       const caps = track.getCapabilities ? track.getCapabilities() : {};
@@ -708,6 +935,9 @@ function loop(){
   const img = wctx.getImageData(0,0,W,H);
   lastFrame = img;
 
+  const motion = sceneMotion(img, W, H);
+  const moving = motion > TRK.motionGate;
+
   const t0 = performance.now();
   let res;
   try{ res = countCylinders(img, W, H); }
@@ -715,53 +945,115 @@ function loop(){
   const ms = performance.now()-t0;
   lastResult = res;
 
+  const live = updateTracks(res, W, moving);
+  updateScene(res, live, moving, H);
+
   const inst = dt>0 ? 1000/dt : 0;
   fpsAvg = fpsAvg ? fpsAvg*0.8 + inst*0.2 : inst;
-  draw(res, W, H);
-  paint(res, ms);
+  draw(live, W, H);
+  paint(res, ms, live, motion);
 }
 
-function draw(res, W, H){
+/* Confirmed tracks get a solid box, a number and their voted tag state.
+   Candidates get a thin dashed box and nothing else — you can watch the
+   detector think without it ever being mistaken for a count. */
+function draw(live, W, H){
   view.width = W; view.height = H;
   vctx.putImageData(lastFrame, 0, 0);
   const lw = Math.max(2, W/300);
-  const colours = {green:'#6edc6e', amber:'#f0b429', red:'#e2775f'};
-  vctx.lineWidth = lw;
+  const colours = {full:'#6edc6e', in_use:'#f0b429', empty:'#e2775f', unsure:'#9aa'};
   vctx.font = '600 '+Math.max(11, W/50)+'px ui-monospace,monospace';
-  for(const c of res.cylinders){
-    vctx.strokeStyle = colours[c.confidence] || '#aaa';
-    vctx.strokeRect(c.box.x0, c.box.y0, c.box.x1-c.box.x0, c.box.y1-c.box.y0);
-    if(c.tag){
-      const [tx0,ty0,tx1,ty1] = c.tag.box;
+
+  const liveIds = new Set(live.map(t=>t.id));
+  vctx.setLineDash([5,5]); vctx.lineWidth = 1; vctx.strokeStyle = 'rgba(255,255,255,.35)';
+  for(const t of TRACKS){
+    if(liveIds.has(t.id)) continue;
+    vctx.strokeRect(t.x-t.w/2, t.y0, t.w, t.y1-t.y0);
+  }
+  vctx.setLineDash([]);
+
+  let i = 0;
+  for(const t of live){
+    i++;
+    const vs = voteState(t.votes);
+    const col = colours[vs.state] || '#9aa';
+    const x0 = t.x - t.w/2;
+    vctx.lineWidth = t.misses ? lw*0.6 : lw;        // coasting reads thinner
+    vctx.strokeStyle = col;
+    vctx.strokeRect(x0, t.y0, t.w, t.y1-t.y0);
+
+    const label = String(i) + (t.tag ? ' '+t.tag.label.toUpperCase() : '');
+    const tw = vctx.measureText(label).width + 8;
+    vctx.fillStyle = col;
+    vctx.fillRect(x0, Math.max(0, t.y0-20), tw, 18);
+    vctx.fillStyle = '#111';
+    vctx.fillText(label, x0+4, Math.max(13, t.y0-6));
+
+    if(t.tag){
+      const [tx0,ty0,tx1,ty1] = t.tag.box;
       vctx.strokeStyle = '#fff'; vctx.lineWidth = 1;
       vctx.strokeRect(tx0, ty0, tx1-tx0, ty1-ty0);
-      vctx.lineWidth = lw;
-      const label = c.tag.label.toUpperCase();
-      const tw = vctx.measureText(label).width + 8;
-      vctx.fillStyle = colours[c.confidence];
-      vctx.fillRect(c.box.x0, Math.max(0,c.box.y0-20), tw, 18);
-      vctx.fillStyle = '#111';
-      vctx.fillText(label, c.box.x0+4, Math.max(13, c.box.y0-6));
     }
   }
 }
 
-function paint(res, ms){
-  const t = res.totals, a = t.all;
-  $('cnt').firstChild.nodeValue = t.count;
-  $('tf').textContent=a.full; $('te').textContent=a.empty;
-  $('tu').textContent=a.in_use; $('tq').textContent=a.unsure;
+/* The three cases that must never look alike: no camera, no rack, and a real
+   rack holding zero. Only a LOCKED scene is ever allowed to print a digit. */
+function paint(res, ms, live, motion){
+  const mode = SCENE.mode;
+  const show = (mode === 'locked' || mode === 'held') && SCENE.commit;
+  const a = show ? SCENE.commit.all : null;
+
+  $('cnt').firstChild.nodeValue = show ? SCENE.commit.count : '—';
+  $('cnt').style.opacity = (mode === 'held') ? '0.45' : '1';
+  $('tf').textContent = a ? a.full   : '—';
+  $('te').textContent = a ? a.empty  : '—';
+  $('tu').textContent = a ? a.in_use : '—';
+  $('tq').textContent = a ? a.unsure : '—';
+
+  const dot = $('dot'), st = $('state');
+  dot.classList.toggle('on', mode === 'locked');
+  if(motion > TRK.motionGate)      st.textContent = 'HOLD STILL';
+  else if(mode === 'locked')       st.textContent = 'LOCKED';
+  else if(mode === 'held')         st.textContent = 'HOLDING';
+  else if(mode === 'locking')      st.textContent = 'LOCKING '+SCENE.good+'/'+TRK.lockFrames;
+  else                             st.textContent = 'LOOKING';
+
   const c = $('cTrust');
-  c.textContent = 'trust '+res.trust+' '+Math.round(res.rackConfidence*100)+'%';
-  c.className = 'chip '+(res.trust==='good'?'ok':res.trust==='weak'?'warn':'no');
+  c.textContent = 'rack '+Math.round(SCENE.score*100)+'% · fit '+
+                  Math.round(res.rackConfidence*100)+'% · even '+
+                  Math.round(SCENE.reg*100)+'% · band '+
+                  Math.round(SCENE.fill*100)+'%';
+  c.className = 'chip '+(SCENE.score>=0.55?'ok':SCENE.score>=0.3?'warn':'no');
+
+  const tc = $('cTrack');
+  tc.textContent = 'tracks '+live.length+'/'+TRACKS.length+
+                   (live.some(t=>t.misses) ? ' ·coast' : '');
+  tc.className = 'chip '+(live.length?'ok':'');
+  const mc = $('cMotion');
+  mc.textContent = motion>=900 ? 'motion —' : 'motion '+motion.toFixed(1);
+  mc.className = 'chip '+(motion > TRK.motionGate ? 'warn' : 'ok');
+
   const w = $('warn');
-  if(res.trust==='none' && t.count>0){
-    w.className='warn show'; w.style.background='rgba(179,64,46,.95)';
-    w.textContent='Does not look like a rack — check the boxes before trusting this';
-  } else if(res.trust==='weak' && t.count>0){
+  if(motion > TRK.motionGate){
     w.className='warn show'; w.style.background='rgba(176,116,0,.95)';
-    w.textContent='Low confidence — recalibrate or re-frame';
+    w.textContent='Hold the phone still — a count needs a steady frame';
+  } else if(mode === 'held'){
+    w.className='warn show'; w.style.background='rgba(176,116,0,.95)';
+    w.textContent='Holding the last good count — re-frame the rack';
+  } else if(mode === 'searching' || mode === 'locking'){
+    w.className='warn show'; w.style.background='rgba(60,66,78,.95)';
+    w.textContent =
+      SCENE.blocker === 'framing' ? 'Cannot see the top of a rack — step back, or there is not one in view'
+      : SCENE.blocker === 'settling' ? 'Settling — hold the frame still a moment'
+      : TRACKS.length ? 'Looking — '+TRACKS.length+' candidate'+
+                        (TRACKS.length>1?'s':'')+', not confirmed yet'
+      : 'No rack in view — nothing is being counted';
+  } else if(SCENE.commit && SCENE.commit.trust === 'weak'){
+    w.className='warn show'; w.style.background='rgba(176,116,0,.95)';
+    w.textContent='Locked but low confidence — check the boxes before quoting it';
   } else w.className='warn';
+
   $('cRate').textContent = fpsAvg.toFixed(1)+' fps · '+ms.toFixed(0)+' ms';
   $('cW').textContent = 'cyl '+(CFG.cylinderWidthFrac*100).toFixed(1)+'%';
 }
@@ -794,6 +1086,7 @@ $('stage').addEventListener('click', e => {
   if(frac<0.005 || frac>0.4){ setMsg('That span looks wrong — try again.'); return; }
   CFG.cylinderWidthFrac = frac;
   store.set('sc_width', frac);
+  resetTracking();
   setMsg('Calibrated: one cylinder = '+(frac*100).toFixed(1)+'% of the frame');
   setTimeout(()=>{ $('m1').classList.remove('on'); $('m2').classList.remove('on'); }, 2500);
 });
@@ -817,12 +1110,17 @@ function drawLog(){
     }).join('')+'</tbody>';
 }
 $('log').onclick = () => {
-  if(!lastResult){ setMsg('Start the camera first.'); return; }
+  if(!stream && !SCENE.commit){ setMsg('Start the camera first.'); return; }
+  // Only a committed count is worth measuring accuracy against; logging a
+  // mid-flicker frame would poison the one honest number we have.
+  if(!SCENE.commit){ setMsg('Nothing locked yet — wait for LOCKED, then log.'); return; }
+  const k = SCENE.commit;
   log.push({when:new Date().toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}),
-            detected:lastResult.totals.count, hand:$('hand').value,
-            full:lastResult.totals.all.full, empty:lastResult.totals.all.empty,
-            in_use:lastResult.totals.all.in_use, unsure:lastResult.totals.all.unsure,
-            trust:lastResult.trust, width:CFG.cylinderWidthFrac.toFixed(4)});
+            detected:k.count, hand:$('hand').value,
+            full:k.all.full, empty:k.all.empty,
+            in_use:k.all.in_use, unsure:k.all.unsure,
+            trust:SCENE.mode==='locked' ? k.trust : k.trust+'(held)',
+            width:k.width.toFixed(4)});
   store.set('sc_log', log); $('hand').value=''; drawLog(); setMsg('Logged.');
 };
 $('csv').onclick = () => {
@@ -837,13 +1135,20 @@ $('csv').onclick = () => {
 };
 $('clear').onclick = () => { log=[]; store.set('sc_log',log); drawLog(); };
 
-/* Offline: cache this page so it opens with no signal at all. */
 if('serviceWorker' in navigator){
   window.addEventListener('load', ()=>{
-    navigator.serviceWorker.register('sw.js').then(()=>{
+    navigator.serviceWorker.register('sw.js').then(r=>{
       $('offline').textContent='offline ready';
       $('offline').className='chip ok';
+      r.update().catch(()=>{});
     }).catch(()=>{});
+    // A cache-first app will happily serve last week's build forever. When a
+    // new worker takes over, reload once so the phone is running the version
+    // that was actually tested.
+    let swapped = false;
+    navigator.serviceWorker.addEventListener('controllerchange', ()=>{
+      if(swapped) return; swapped = true; location.reload();
+    });
   });
 }
 drawLog();

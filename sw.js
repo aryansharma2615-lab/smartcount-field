@@ -3,11 +3,17 @@
    that file and serving it first. The site visit happens inside a concrete
    building with no signal; anything that needs the network at demo time is a
    demo that does not happen. */
-const CACHE = 'smartcount-v1';
-const ASSETS = ['./', './index.html', './manifest.webmanifest'];
+/* Bump CACHE on every deploy. Cache-first means a phone will otherwise keep
+   running the build it installed first, forever — and the version on the
+   phone is the version at the customer site. */
+const CACHE = 'smartcount-v2-tracking';
+const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  e.waitUntil(caches.open(CACHE)
+    // reload: bypass the HTTP cache, or install re-stores the same stale copy
+    .then(c => c.addAll(ASSETS.map(u => new Request(u, {cache: 'reload'}))))
+    .then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys()
