@@ -1,0 +1,853 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SmartCount">
+<meta name="theme-color" content="#0d1012">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.svg">
+<title>SmartCount</title>
+<!--
+  SMART COUNT — STANDALONE PHONE COUNTER
+  Shawarma Prints | 2026-11-02
+
+  One file. No server, no network, no Mac. Everything runs in this page, which
+  is the only thing that works inside a concrete building with no signal.
+
+  It is a faithful port of the SHAPE layer from smartcount/layers.py, plus
+  per-cylinder colour and colour-coded tags. It deliberately does NOT do OCR:
+  reading written tags needs Tesseract, which is megabytes of download and
+  seconds per tag on a phone. Colour tags are what actually resolve a rack
+  quickly, and on the bench they settled every cylinder in 39 ms where OCR took
+  775 ms for the same answer.
+
+  Keep the algorithm in step with layers.py. The function names match on
+  purpose so the two can be read side by side.
+-->
+<style>
+:root{
+  --bg:#0d1012; --panel:#1d2427; --line:#2b3438; --ink:#e6eaea; --muted:#8a9499;
+  --accent:#f0b429; --accent-ink:#14191b; --steel:#3c5566;
+  --good:#2f7d4a; --warn:#b07400; --bad:#b3402e; --banner:#5b2a6e;
+  --f-display:"Helvetica Neue",Arial,sans-serif;
+  --f-body:system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:ui-monospace,Menlo,Consolas,monospace;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);
+  font-size:15px;line-height:1.45;overscroll-behavior:none;
+  padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+.wrap{max-width:720px;margin:0 auto;padding:10px 12px 28px;display:flex;flex-direction:column;gap:10px}
+.hd{display:flex;justify-content:space-between;align-items:center}
+.eyebrow{font-family:var(--f-mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#6f797e}
+h1{font:700 19px var(--f-display);margin:0}
+.stage{position:relative;background:#000;border-radius:12px;overflow:hidden;touch-action:manipulation}
+canvas#view{display:block;width:100%;height:auto}
+video{position:absolute;inset:0;width:100%;height:100%;opacity:0;pointer-events:none}
+.badge{position:absolute;top:8px;right:8px;display:flex;gap:5px;align-items:center;
+  background:rgba(0,0,0,.66);font:600 10px var(--f-mono);letter-spacing:.09em;padding:5px 9px;border-radius:5px}
+.badge i{width:7px;height:7px;border-radius:50%;background:#e5484d;display:block}
+.badge i.on{background:#3ddc6e}
+.cnt{position:absolute;left:0;bottom:0;background:rgba(91,42,110,.92);color:#fff;
+  font:500 clamp(26px,9vw,56px)/1.05 var(--f-mono);padding:6px 18px 6px 12px;font-variant-numeric:tabular-nums}
+.cnt small{display:block;font:600 10px var(--f-mono);letter-spacing:.12em;opacity:.82}
+.warn{position:absolute;left:0;right:0;top:0;background:rgba(179,64,46,.95);color:#fff;
+  font:600 12px var(--f-body);padding:7px 10px;text-align:center;display:none}
+.warn.show{display:block}
+.calib{position:absolute;inset:0;background:rgba(0,0,0,.58);display:none;align-items:center;
+  justify-content:center;text-align:center;padding:18px}
+.calib.on{display:flex}
+.calib p{font:600 15px var(--f-body);color:#fff;text-shadow:0 1px 3px #000;margin:0}
+.mark{position:absolute;width:2px;top:0;bottom:0;background:var(--accent);display:none}
+.mark.on{display:block}
+.tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.tile{border-radius:9px;padding:8px 6px;text-align:center;background:var(--panel);border:1px solid var(--line)}
+.tile .n{font:700 25px/1 var(--f-display);font-variant-numeric:tabular-nums}
+.tile .l{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.tile.f{border-bottom:4px solid var(--good)}.tile.e{border-bottom:4px solid var(--bad)}
+.tile.u{border-bottom:4px solid var(--warn)}.tile.q{border-bottom:4px solid var(--steel)}
+.row{display:flex;gap:7px;flex-wrap:wrap}
+button,select,input{font:600 15px var(--f-body);border-radius:8px;border:1px solid var(--line);
+  background:var(--panel);color:var(--ink);padding:11px 10px;min-height:44px}
+button{cursor:pointer;flex:1 1 0;min-width:80px}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+button[aria-pressed="true"]{background:var(--steel);color:#fff;border-color:var(--steel)}
+input{font-size:16px}
+.chips{display:flex;gap:5px;flex-wrap:wrap}
+.chip{font:600 10px var(--f-mono);padding:4px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.chip.ok{color:#5fbf80;border-color:var(--good)}
+.chip.warn{color:#e0a83c;border-color:#8a5e00}
+.chip.no{color:#e2775f;border-color:#8a3425}
+.note{font-size:12px;color:var(--muted);border-left:3px solid var(--steel);padding-left:9px;margin:0}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:5px 4px;border-bottom:1px solid var(--line);font-size:12px}
+th{font:600 10px var(--f-mono);text-transform:uppercase;color:var(--muted)}
+td.num,th.num{text-align:right}
+details summary{cursor:pointer;font-size:13px;color:var(--muted);padding:6px 0}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hd">
+    <div><span class="eyebrow">Shawarma Prints</span><h1>SmartCount</h1></div>
+    <span class="chip" id="offline">on this phone</span>
+  </div>
+
+  <div class="stage" id="stage">
+    <canvas id="view"></canvas>
+    <video id="v" playsinline muted autoplay></video>
+    <div class="warn" id="warn"></div>
+    <div class="badge"><i id="dot"></i><span id="state">TAP START</span></div>
+    <div class="cnt" id="cnt">—<small>CYLINDERS</small></div>
+    <div class="calib" id="calib"><p id="calibMsg"></p></div>
+    <div class="mark" id="m1"></div><div class="mark" id="m2"></div>
+  </div>
+
+  <div class="tiles">
+    <div class="tile f"><div class="n" id="tf">0</div><div class="l">Full</div></div>
+    <div class="tile e"><div class="n" id="te">0</div><div class="l">Empty</div></div>
+    <div class="tile u"><div class="n" id="tu">0</div><div class="l">In use</div></div>
+    <div class="tile q"><div class="n" id="tq">0</div><div class="l">Unsure</div></div>
+  </div>
+
+  <div class="row">
+    <button class="primary" id="start">Start camera</button>
+    <button id="calibBtn">Calibrate</button>
+    <button id="freeze" aria-pressed="false">Freeze</button>
+    <button id="torch" aria-pressed="false">Light</button>
+  </div>
+  <div class="row">
+    <button id="zoom" style="flex:1 1 70px">Zoom 1&times;</button>
+    <button id="tagMode" aria-pressed="true" style="flex:2 1 120px">Tags on</button>
+    <button id="shot" style="flex:1 1 90px">Photo</button>
+  </div>
+
+  <div class="chips">
+    <span class="chip" id="cTrust">trust —</span>
+    <span class="chip" id="cRate">—</span>
+    <span class="chip" id="cW">cyl —</span>
+  </div>
+
+  <div class="row">
+    <input id="hand" type="number" inputmode="numeric" min="0" placeholder="Hand count" style="flex:2 1 110px">
+    <button id="log" style="flex:1 1 80px">Log</button>
+  </div>
+  <div class="chip" id="msg" style="border:0;padding-left:0"></div>
+
+  <details>
+    <summary>Accuracy log &amp; CSV</summary>
+    <div id="acc" class="note" style="margin:6px 0"></div>
+    <div class="row" style="margin-bottom:6px">
+      <button id="csv">Copy CSV</button><button id="clear">Clear log</button>
+    </div>
+    <table id="logTable"></table>
+  </details>
+
+  <p class="note">The boxes are the proof. If they are not sitting on cylinders the
+    number is wrong &mdash; recalibrate before quoting it. Counts by shape and reads
+    tag colour. It does not read pressure or level, and this offline version does
+    not read tag <em>text</em>.</p>
+</div>
+
+<script>
+"use strict";
+/* ===================================================================
+   PORT OF smartcount/layers.py — keep the two in step.
+   =================================================================== */
+
+const CFG = {
+  workWidth: 900,            // detection resolution; the phone re-encodes to this
+  cylinderWidthFrac: 0.09,   // THE calibration number, set by two taps
+  minPeakFrac: 0.34,
+  nmsFrac: 0.62,
+  interiorPenalty: 0.9,
+  minOccupancy: 0.42,
+  minAspect: 1.6,
+  tagsOn: true,
+  // Green = full, yellow = in use, red = empty. The common supplier system.
+  tagColours: [
+    {label:'Full',  rgb:[60,150,80],  tol:38, state:'full'},
+    {label:'In use',rgb:[225,190,60], tol:38, state:'in_use'},
+    {label:'Empty', rgb:[185,55,45],  tol:38, state:'empty'}
+  ]
+};
+
+/* ---------- small numeric helpers ---------- */
+function smooth(a, k){
+  k = Math.max(1, k|1);
+  if(k === 1 || a.length < k) return Float64Array.from(a);
+  const pad = k>>1, n = a.length, out = new Float64Array(n);
+  let sum = 0;
+  const at = i => a[i < 0 ? 0 : (i >= n ? n-1 : i)];
+  for(let i=-pad;i<=pad;i++) sum += at(i);
+  for(let x=0;x<n;x++){ out[x] = sum/k; sum += at(x+pad+1) - at(x-pad); }
+  return out;
+}
+function median(arr){
+  const b = Float64Array.from(arr).sort();
+  const n = b.length;
+  return n ? (n&1 ? b[n>>1] : (b[n/2-1]+b[n/2])/2) : 0;
+}
+function longestRun(mask){
+  let bestLen=0,bestStart=0,s=-1;
+  for(let i=0;i<mask.length;i++){
+    if(mask[i]){ if(s<0) s=i; }
+    else if(s>=0){ if(i-s>bestLen){bestLen=i-s;bestStart=s;} s=-1; }
+  }
+  if(s>=0 && mask.length-s>bestLen){ bestLen=mask.length-s; bestStart=s; }
+  return bestLen ? [bestStart,bestStart+bestLen] : [0,mask.length];
+}
+function cumsum(a){
+  const c = new Float64Array(a.length+1);
+  for(let i=0;i<a.length;i++) c[i+1] = c[i] + a[i];
+  return c;
+}
+function windowMean(cum, centre, half, n){
+  const lo = Math.max(0, Math.min(n, centre-half));
+  const hi = Math.max(0, Math.min(n, centre+half+1));
+  return hi>lo ? (cum[hi]-cum[lo])/(hi-lo) : 0;
+}
+
+/* A signal in units of its own local, outlier-resistant spread.
+   MAD not percentile: a rack's outer edges are many times stronger than the
+   seam between two touching bottles, and a percentile scale lets those two
+   edges set the yardstick for everything between them. Nothing is clipped —
+   the useful signal is an oscillation and the seams are its troughs. */
+function standardise(a, win){
+  const n = a.length;
+  win = Math.max(8, win|1);
+  const step = Math.max(1, win>>3), half = win>>1;
+  const ax=[], med=[], mad=[];
+  for(let x=0;x<n;x+=step){
+    const seg = a.slice(Math.max(0,x-half), Math.min(n,x+half+1));
+    const m = median(seg);
+    const dev = new Float64Array(seg.length);
+    for(let i=0;i<seg.length;i++) dev[i] = Math.abs(seg[i]-m);
+    ax.push(x); med.push(m); mad.push(median(dev));
+  }
+  const gm = (()=>{ const m=median(a), d=new Float64Array(n);
+    for(let i=0;i<n;i++) d[i]=Math.abs(a[i]-m); return median(d); })();
+  const floor = Math.max(0.3*gm*1.4826, 1e-9);
+  const out = new Float64Array(n);
+  let j = 0;
+  for(let x=0;x<n;x++){
+    while(j < ax.length-2 && ax[j+1] <= x) j++;
+    const x0=ax[j], x1=ax[Math.min(j+1,ax.length-1)];
+    const t = x1>x0 ? (x-x0)/(x1-x0) : 0;
+    const m = med[j] + (med[Math.min(j+1,med.length-1)]-med[j])*t;
+    const d = mad[j] + (mad[Math.min(j+1,mad.length-1)]-mad[j])*t;
+    out[x] = (a[x]-m) / Math.max(d*1.4826, floor);
+  }
+  return out;
+}
+
+/* ---------- image planes ---------- */
+function planes(img, W, H){
+  const gray = new Float64Array(W*H);
+  const d = img.data;
+  for(let p=0,i=0;p<W*H;p++,i+=4)
+    gray[p] = 0.114*d[i] + 0.587*d[i+1] + 0.299*d[i+2];   // BGR-ish weights, as cv2
+  // 3x3 Sobel x, absolute
+  const agx = new Float64Array(W*H);
+  for(let y=1;y<H-1;y++){
+    for(let x=1;x<W-1;x++){
+      const o=y*W+x;
+      const v = (gray[o-W+1]+2*gray[o+1]+gray[o+W+1]) - (gray[o-W-1]+2*gray[o-1]+gray[o+W-1]);
+      agx[o] = v<0 ? -v : v;
+    }
+  }
+  return {gray, agx};
+}
+
+function rackBand(agx, W, H){
+  const prof = new Float64Array(H);
+  for(let y=0;y<H;y++){ let s=0; for(let x=0;x<W;x++) s+=agx[y*W+x]; prof[y]=s; }
+  const sm = smooth(prof, Math.max(3, (H/40)|0));
+  let mx=0; for(let i=0;i<H;i++) if(sm[i]>mx) mx=sm[i];
+  if(mx<=0) return [0,H];
+  const mask = new Uint8Array(H);
+  for(let i=0;i<H;i++) mask[i] = sm[i] >= 0.30*mx ? 1 : 0;
+  let [y0,y1] = longestRun(mask);
+  if(y1-y0 < Math.max(4, H/10)) return [0,H];
+  const pad = ((y1-y0)*0.06)|0;
+  return [Math.max(0,y0-pad), Math.min(H,y1+pad)];
+}
+
+/* Column medians, not sums. A restraint chain, a shelf lip or a band of shadow
+   is a horizontal stripe landing in every column at once; a median over
+   hundreds of rows does not notice a stripe a few rows tall. Rows are
+   subsampled because a median does not need every one of them. */
+function columnMedians(src, W, y0, y1, step){
+  const rows=[]; for(let y=y0;y<y1;y+=step) rows.push(y);
+  const out = new Float64Array(W), buf = new Float64Array(rows.length);
+  for(let x=0;x<W;x++){
+    for(let i=0;i<rows.length;i++) buf[i] = src[rows[i]*W + x];
+    out[x] = median(buf);
+  }
+  return out;
+}
+
+function cylinderScore(gray, agx, W, H, y0, y1, width){
+  const rowStep = Math.max(1, Math.round((y1-y0)/90));
+  const normWin = width*4, half = width>>1;
+  const edgeRaw = smooth(columnMedians(agx, W, y0, y1, rowStep), Math.max(3, width>>3));
+  const edge = standardise(edgeRaw, normWin);
+  const eCum = cumsum(edge);
+  const side = Math.max(1, (width/12)|0);
+  const inner = Math.max(1, (width/5)|0);
+  const edgeTerm = new Float64Array(W);
+  for(let x=0;x<W;x++){
+    edgeTerm[x] = windowMean(eCum,x-half,side,W) + windowMean(eCum,x+half,side,W)
+                - CFG.interiorPenalty*windowMean(eCum,x,inner,W);
+  }
+  const intenRaw = smooth(columnMedians(gray, W, y0, y1, rowStep), Math.max(3, width>>3));
+  const iCum = cumsum(intenRaw);
+  const c8 = Math.max(1,(width/8)|0), f10 = Math.max(1,(width/10)|0);
+  const shadeTerm = new Float64Array(W);
+  for(let x=0;x<W;x++){
+    shadeTerm[x] = windowMean(iCum,x,c8,W)
+      - 0.5*(windowMean(iCum,x-half,f10,W) + windowMean(iCum,x+half,f10,W));
+  }
+  const a = standardise(edgeTerm, normWin), b = standardise(shadeTerm, normWin);
+  const out = new Float64Array(W);
+  for(let x=0;x<W;x++) out[x] = a[x] + b[x];
+  return out;
+}
+
+function otsu(vals){
+  const hist = new Float64Array(256);
+  for(let i=0;i<vals.length;i++) hist[vals[i]]++;
+  const total = vals.length;
+  let sum=0; for(let i=0;i<256;i++) sum += i*hist[i];
+  let sumB=0, wB=0, best=0, thr=0;
+  for(let t=0;t<256;t++){
+    wB += hist[t]; if(!wB) continue;
+    const wF = total-wB; if(!wF) break;
+    sumB += t*hist[t];
+    const mB = sumB/wB, mF = (sum-sumB)/wF;
+    const between = wB*wF*(mB-mF)*(mB-mF);
+    if(between>best){ best=between; thr=t; }
+  }
+  return thr;
+}
+
+/* Fraction of the rack band, per column, that is not background. The strip of
+   wall above the rack teaches what background looks like, which is what stops
+   the detector finding rhythm in sensor noise on an empty wall. */
+function occupancy(img, W, H, y0, y1, width){
+  if(y1-y0 < 4) return null;
+  const strip = Math.max(3, ((y1-y0)/10)|0);
+  let sy0 = Math.max(0, y0-strip), sy1 = y0;
+  if(sy1<=sy0){ sy0=0; sy1=Math.max(3,(H/12)|0); }
+  const d = img.data;
+  const rs=[],gs=[],bs=[];
+  for(let y=sy0;y<sy1;y++) for(let x=0;x<W;x+=3){
+    const i=(y*W+x)*4; rs.push(d[i]); gs.push(d[i+1]); bs.push(d[i+2]);
+  }
+  if(!rs.length) return null;
+  const wr=median(rs), wg=median(gs), wb=median(bs);
+  // A busy background strip teaches nothing, and a bad one is worse than none.
+  const devs=[]; for(let i=0;i<rs.length;i++) devs.push(Math.abs(rs[i]-wr)+Math.abs(gs[i]-wg)+Math.abs(bs[i]-wb));
+  if(median(devs) > 60) return null;
+
+  const scaled = new Uint8Array(W*(y1-y0));
+  let k=0;
+  for(let y=y0;y<y1;y++) for(let x=0;x<W;x++){
+    const i=(y*W+x)*4;
+    const diff = Math.abs(d[i]-wr)+Math.abs(d[i+1]-wg)+Math.abs(d[i+2]-wb);
+    scaled[k++] = Math.min(255, (diff/3)|0);
+  }
+  const thr = Math.max(6, Math.min(90, otsu(scaled)));
+  const occ = new Float64Array(W);
+  const rowsN = y1-y0;
+  for(let x=0;x<W;x++){
+    let c=0;
+    for(let r=0;r<rowsN;r++) if(scaled[r*W+x] > thr) c++;
+    occ[x] = c/rowsN;
+  }
+  return smooth(occ, Math.max(3, width>>3));
+}
+
+function occupiedRuns(occ, width, minOcc){
+  const runs=[]; let s=-1;
+  for(let i=0;i<occ.length;i++){
+    if(occ[i]>=minOcc){ if(s<0) s=i; }
+    else if(s>=0){ runs.push([s,i]); s=-1; }
+  }
+  if(s>=0) runs.push([s,occ.length]);
+  const merged=[];
+  for(const [a,b] of runs){
+    if(merged.length && a-merged[merged.length-1][1] <= Math.max(2,width/6)) merged[merged.length-1][1]=b;
+    else merged.push([a,b]);
+  }
+  return merged.filter(([a,b]) => b-a >= width*0.55);
+}
+
+function combPositions(a,b,width,n){
+  const span = Math.max(0,(b-a)-width);
+  if(n<=1) return [a+(b-a)/2];
+  const step = span/(n-1), out=[];
+  for(let k=0;k<n;k++) out.push(a + width/2 + k*step);
+  return out;
+}
+
+/* How many cylinders fit this run. Solved by trying every count the run can
+   geometrically hold and asking which one's INTERIOR SEAMS line up with the
+   dark seams actually in the picture.
+     - seams, not middles: a touching rack is troughs at the joins and flat
+       across the bodies, so a template of bumps at the middles matches nothing;
+     - interior only: every candidate puts a boundary at each end of the run,
+       so those two carry no information and otherwise hand victory to n=2;
+     - densest within a margin: a comb at twice the true pitch sits on every
+       other real seam and can win outright once seams go faint, while a comb at
+       half the pitch has no such excuse. */
+function fitComb(score, a, b, width){
+  const runW = b-a;
+  if(runW < width*1.35)
+    return {centres:[Math.round(a+runW/2)], pitch:width,
+            quality:Math.max(0, 1-Math.abs(runW/width-1)*1.6)};
+  const span = runW - width;
+  const nLo = Math.max(2, Math.ceil(span/(width*2.6))+1);
+  const nHi = Math.min(400, Math.max(nLo, Math.floor(span/(width*0.72))+1));
+  const trim = Math.min(width*0.6, Math.max(0, span/2))|0;
+  let ia=a+trim, ib=b-trim;
+  if(ib-ia < Math.max(8,width>>1)){ ia=a; ib=b; }
+  const nSeg = ib-ia;
+  const seg = new Float64Array(nSeg);
+  let mean=0; for(let i=0;i<nSeg;i++) mean += score[ia+i]; mean/=nSeg||1;
+  let segNorm=0;
+  for(let i=0;i<nSeg;i++){ seg[i]=score[ia+i]-mean; segNorm += seg[i]*seg[i]; }
+  segNorm = Math.sqrt(segNorm)||1;
+  const sigma = Math.max(1, width/5), inv = 1/(2*sigma*sigma);
+  const scored=[];
+  for(let n=nLo;n<=nHi;n++){
+    const step = span/(n-1);
+    const t = new Float64Array(nSeg);
+    for(let k=0;k<n-1;k++){
+      const seam = a + width/2 + (k+0.5)*step - ia;
+      const lo = Math.max(0, Math.floor(seam-4*sigma)), hi = Math.min(nSeg, Math.ceil(seam+4*sigma));
+      for(let i=lo;i<hi;i++){ const dx=i-seam; t[i] -= Math.exp(-dx*dx*inv); }
+    }
+    let tm=0; for(let i=0;i<nSeg;i++) tm+=t[i]; tm/=nSeg||1;
+    let dot=0, tn=0;
+    for(let i=0;i<nSeg;i++){ const tv=t[i]-tm; dot += seg[i]*tv; tn += tv*tv; }
+    tn = Math.sqrt(tn)||1;
+    scored.push([n, dot/(segNorm*tn)]);
+  }
+  if(!scored.length)
+    return {centres:[Math.round(a+runW/2)], pitch:width, quality:0};
+  let best = -1e18; for(const [,c] of scored) if(c>best) best=c;
+  let bestN = scored.filter(s=>s[1]===best)[0][0];
+  if(best>0){
+    const floor = 0.75*best;
+    bestN = Math.max(...scored.filter(s=>s[1]>=floor).map(s=>s[0]));
+  }
+  const quality = best>0 ? Math.max(0,Math.min(1,best/0.35)) : 0;
+  const pitch = bestN>1 ? span/(bestN-1) : width;
+  const reach = Math.max(1, (pitch*0.22)|0);
+  const centres = combPositions(a,b,width,bestN).map(x=>{
+    const lo=Math.max(0,(x|0)-reach), hi=Math.min(score.length,(x|0)+reach+1);
+    let bi=lo, bv=-1e18;
+    for(let i=lo;i<hi;i++) if(score[i]>bv){ bv=score[i]; bi=i; }
+    return bi;
+  });
+  return {centres, pitch, quality};
+}
+
+/* ---------- colour ---------- */
+function rgb2hsv(r,g,b){
+  r/=255; g/=255; b/=255;
+  const mx=Math.max(r,g,b), mn=Math.min(r,g,b), d=mx-mn;
+  let h=0;
+  if(d){ if(mx===r) h=((g-b)/d)%6; else if(mx===g) h=(b-r)/d+2; else h=(r-g)/d+4;
+         h*=60; if(h<0) h+=360; }
+  return [h, mx?d/mx*100:0, mx*100];
+}
+/* The same distance detector.py uses: hue only counts when both colours have
+   enough saturation to have a trustworthy one, so grey matches only grey. */
+function colourDistance(hsv, rgb){
+  const c = rgb2hsv(rgb[0],rgb[1],rgb[2]);
+  let dh = Math.abs(hsv[0]-c[0]); if(dh>180) dh = 360-dh;
+  const hue = (hsv[1]<15 || c[1]<15) ? 0 : dh/360*220;
+  const ds = hsv[1]-c[1], dv = (hsv[2]-c[2])*0.45;
+  return Math.sqrt(hue*hue + ds*ds + dv*dv);
+}
+function medianRGB(img, W, H, x0, x1, y0, y1){
+  x0=Math.max(0,x0|0); x1=Math.min(W,x1|0); y0=Math.max(0,y0|0); y1=Math.min(H,y1|0);
+  if(x1-x0<1||y1-y0<1) return null;
+  const d=img.data, rs=[],gs=[],bs=[];
+  const sx=Math.max(1,((x1-x0)/14)|0), sy=Math.max(1,((y1-y0)/14)|0);
+  for(let y=y0;y<y1;y+=sy) for(let x=x0;x<x1;x+=sx){
+    const i=(y*W+x)*4; rs.push(d[i]); gs.push(d[i+1]); bs.push(d[i+2]);
+  }
+  return rs.length ? [Math.round(median(rs)),Math.round(median(gs)),Math.round(median(bs))] : null;
+}
+
+/* ---------- tags, by colour ----------
+   Inside each cylinder box, find the patch that both differs from the bottle
+   body and matches one of the taught tag colours. No contours and no OCR: this
+   has to finish in milliseconds on a phone with no network. */
+function readTag(img, W, H, box){
+  if(!CFG.tagsOn) return null;
+  const bw = box.x1-box.x0, bh = box.y1-box.y0;
+  const body = medianRGB(img, W, H, box.x0+bw*0.28, box.x1-bw*0.28,
+                         box.y0+bh*0.55, box.y1-bh*0.08);
+  if(!body) return null;
+  const cellH = Math.max(4, (bh*0.07)|0);
+  let best = null;
+  for(let y=box.y0+bh*0.05; y<box.y0+bh*0.80; y+=cellH){
+    const patch = medianRGB(img, W, H, box.x0+bw*0.18, box.x1-bw*0.18, y, y+cellH);
+    if(!patch) continue;
+    const dBody = Math.hypot(patch[0]-body[0], patch[1]-body[1], patch[2]-body[2]);
+    if(dBody < 42) continue;                     // same as the bottle: not a tag
+    const hsv = rgb2hsv(patch[0],patch[1],patch[2]);
+    for(const c of CFG.tagColours){
+      const d = colourDistance(hsv, c.rgb);
+      if(d < c.tol){
+        const conf = (1 - d/c.tol) * Math.min(1, dBody/90);
+        if(!best || conf > best.conf)
+          best = {label:c.label, state:c.state, conf, rgb:patch,
+                  box:[box.x0+bw*0.18, y, box.x1-bw*0.18, y+cellH]};
+      }
+    }
+  }
+  return best;
+}
+
+/* ---------- the whole pipeline ---------- */
+function countCylinders(img, W, H){
+  const width = Math.max(3, Math.round(CFG.cylinderWidthFrac*W));
+  const dbg = {width};
+  const empty = {cylinders:[], totals:{count:0, all:{full:0,empty:0,in_use:0,unsure:0}},
+                 rackConfidence:0, trust:'none', dbg};
+  if(width >= W/2) return empty;
+
+  const {gray, agx} = planes(img, W, H);
+  const [y0,y1] = rackBand(agx, W, H);
+  dbg.band=[y0,y1];
+  if(y1-y0 < Math.max(4, CFG.minAspect*width*0.5)) return empty;
+
+  const score = cylinderScore(gray, agx, W, H, y0, y1, width);
+  const occ = occupancy(img, W, H, y0, y1, width);
+  let centres=[], quals=[];
+  if(occ){
+    for(const [a,b] of occupiedRuns(occ, width, CFG.minOccupancy)){
+      const f = fitComb(score, a, b, width);
+      const good = f.centres.filter(x => x>=width/2 && x<=W-width/2);
+      quals.push([f.quality, good.length]);
+      centres = centres.concat(good);
+    }
+  } else {
+    // No wall above the rack to learn a background from: fall back to peaks and
+    // never claim to understand the frame.
+    let ref=0; const sorted=Float64Array.from(score).sort();
+    ref = sorted[Math.floor(sorted.length*0.97)] || 1e-6;
+    const floor = CFG.minPeakFrac*ref, gap = Math.max(1, Math.round(CFG.nmsFrac*width));
+    const cand=[];
+    for(let x=width>>1;x<=W-(width>>1);x++)
+      if(score[x]>=score[x-1] && score[x]>=score[x+1] && score[x]>=floor) cand.push(x);
+    cand.sort((p,q)=>score[q]-score[p]);
+    for(const x of cand) if(centres.every(k=>Math.abs(x-k)>=gap)) centres.push(x);
+    quals.push([0.25, centres.length]);
+  }
+  centres = Array.from(new Set(centres)).sort((a,b)=>a-b);
+  dbg.centres = centres.length;
+
+  const cylinders = centres.map(x=>{
+    const bx0 = Math.max(0, x-(width>>1)), bx1 = Math.min(W, bx0+width);
+    const box = {x0:bx0, x1:bx1, y0, y1};
+    const shoulder = medianRGB(img,W,H, bx0+width*0.25, bx1-width*0.25,
+                               y0+(y1-y0)*0.10, y0+(y1-y0)*0.30);
+    const body = medianRGB(img,W,H, bx0+width*0.25, bx1-width*0.25,
+                           y0+(y1-y0)*0.45, y0+(y1-y0)*0.80);
+    const tag = readTag(img, W, H, box);
+    let state='unsure', band='red', conf=0.2;
+    if(tag && tag.state){ state=tag.state; band='green'; conf=Math.min(1,0.5+0.5*tag.conf); }
+    return {box, shoulder, body, tag, state, confidence:band, conf};
+  });
+
+  const all = {full:0, empty:0, in_use:0, unsure:0};
+  for(const c of cylinders) all[c.state]++;
+
+  // Does this frame even look like a rack? A count can come out exactly right
+  // for entirely the wrong reason — a cluttered scene sliced into strips — and
+  // an accidentally-correct number is worse than a wrong one, because it
+  // teaches you to trust it.
+  const totalN = quals.reduce((s,[,n])=>s+n,0);
+  const fitQ = totalN ? quals.reduce((s,[q,n])=>s+q*n,0)/totalN : 0;
+  const widths = cylinders.map(c=>c.box.x1-c.box.x0);
+  const want = CFG.cylinderWidthFrac*W;
+  const coherent = !widths.length || (median(widths)/Math.max(1,want) >= 0.6 &&
+                                      median(widths)/Math.max(1,want) <= 1.7);
+  const rackConfidence = +(fitQ * (coherent?1:0.3)).toFixed(3);
+  const trust = rackConfidence>=0.55 ? 'good' : (rackConfidence>=0.3 ? 'weak' : 'none');
+
+  return {cylinders, totals:{count:cylinders.length, all}, rackConfidence, trust, dbg};
+}
+
+/* ===================================================================
+   UI
+   =================================================================== */
+const $ = id => document.getElementById(id);
+const view = $('view'), vctx = view.getContext('2d');
+const v = $('v');
+const work = document.createElement('canvas');
+const wctx = work.getContext('2d', {willReadFrequently:true});
+let stream=null, track=null, timer=null, frozen=false, zoom=1, lastResult=null;
+let lastFrame=null, fpsAvg=0, tPrev=0;
+
+const store = {
+  get(k,d){ try{ const x=localStorage.getItem(k); return x?JSON.parse(x):d; }catch(e){ return d; } },
+  set(k,x){ try{ localStorage.setItem(k, JSON.stringify(x)); }catch(e){} }
+};
+let log = store.get('sc_log', []);
+CFG.cylinderWidthFrac = store.get('sc_width', CFG.cylinderWidthFrac);
+
+function setMsg(t){ $('msg').textContent = t||''; }
+
+/* ---------- camera ---------- */
+$('start').onclick = async () => {
+  if(stream){ stopCam(); return; }
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}},
+      audio:false});
+  }catch(err){
+    $('state').textContent='BLOCKED';
+    setMsg('Camera blocked ('+err.name+'). iOS only gives the camera to a page opened over https, or to a file opened from Files.');
+    return;
+  }
+  v.srcObject = stream; await v.play();
+  track = stream.getVideoTracks()[0];
+  const s = track.getSettings();
+  $('dot').classList.add('on'); $('state').textContent='LIVE';
+  $('start').textContent='Stop';
+  setMsg('Camera '+(s.width||'?')+'×'+(s.height||'?')+' · all processing on this phone');
+  keepAwake();
+  loop();
+};
+function stopCam(){
+  if(timer) cancelAnimationFrame(timer);
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  stream=null; timer=null;
+  $('dot').classList.remove('on'); $('state').textContent='STOPPED';
+  $('start').textContent='Start camera';
+}
+let lock=null;
+async function keepAwake(){
+  try{
+    lock = await navigator.wakeLock.request('screen');
+    document.addEventListener('visibilitychange', ()=>{
+      if(document.visibilityState==='visible' && stream) keepAwake(); });
+  }catch(e){}
+}
+
+/* Zoom gets more pixels onto the cylinders, which is the only thing that makes
+   small detail detectable. Real camera zoom where the device allows it, a
+   centre crop where it does not. */
+$('zoom').onclick = async () => {
+  zoom = zoom>=3 ? 1 : zoom+1;
+  $('zoom').textContent = 'Zoom '+zoom+'×';
+  if(track){
+    try{
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      if(caps.zoom){
+        const z = Math.min(caps.zoom.max, Math.max(caps.zoom.min, zoom));
+        await track.applyConstraints({advanced:[{zoom:z}]});
+        setMsg('Optical/driver zoom '+z.toFixed(1)+'×');
+        return;
+      }
+    }catch(e){}
+  }
+  setMsg('Digital zoom '+zoom+'× (centre crop)');
+};
+$('torch').onclick = async () => {
+  if(!track) return;
+  const on = $('torch').getAttribute('aria-pressed')!=='true';
+  try{ await track.applyConstraints({advanced:[{torch:on}]});
+       $('torch').setAttribute('aria-pressed', on); }
+  catch(e){ setMsg('This camera has no controllable light.'); }
+};
+$('freeze').onclick = () => {
+  frozen = !frozen; $('freeze').setAttribute('aria-pressed', frozen);
+};
+$('tagMode').onclick = () => {
+  CFG.tagsOn = !CFG.tagsOn;
+  $('tagMode').setAttribute('aria-pressed', CFG.tagsOn);
+  $('tagMode').textContent = CFG.tagsOn ? 'Tags on' : 'Tags off';
+};
+$('shot').onclick = () => {
+  if(!lastFrame) return;
+  const a = document.createElement('a');
+  a.download = 'smartcount-'+new Date().toISOString().replace(/[:.]/g,'-')+'.jpg';
+  a.href = view.toDataURL('image/jpeg', 0.9); a.click();
+  setMsg('Saved the annotated frame to your photos/downloads.');
+};
+
+/* ---------- the loop ---------- */
+function loop(){
+  timer = requestAnimationFrame(loop);
+  if(!stream || !v.videoWidth) return;
+  if(frozen){ return; }
+  const now = performance.now();
+  if(tPrev && now-tPrev < 110) return;         // cap the rate; detection is the cost
+  const dt = now-tPrev; tPrev = now;
+
+  // Grab at the detection size, cropping for digital zoom.
+  const W = CFG.workWidth;
+  const H = Math.round(v.videoHeight * W / v.videoWidth);
+  work.width = W; work.height = H;
+  const sw = v.videoWidth/zoom, sh = v.videoHeight/zoom;
+  const sx = (v.videoWidth-sw)/2, sy = (v.videoHeight-sh)/2;
+  wctx.drawImage(v, sx, sy, sw, sh, 0, 0, W, H);
+  const img = wctx.getImageData(0,0,W,H);
+  lastFrame = img;
+
+  const t0 = performance.now();
+  let res;
+  try{ res = countCylinders(img, W, H); }
+  catch(e){ setMsg('Detector error: '+e.message); return; }
+  const ms = performance.now()-t0;
+  lastResult = res;
+
+  const inst = dt>0 ? 1000/dt : 0;
+  fpsAvg = fpsAvg ? fpsAvg*0.8 + inst*0.2 : inst;
+  draw(res, W, H);
+  paint(res, ms);
+}
+
+function draw(res, W, H){
+  view.width = W; view.height = H;
+  vctx.putImageData(lastFrame, 0, 0);
+  const lw = Math.max(2, W/300);
+  const colours = {green:'#6edc6e', amber:'#f0b429', red:'#e2775f'};
+  vctx.lineWidth = lw;
+  vctx.font = '600 '+Math.max(11, W/50)+'px ui-monospace,monospace';
+  for(const c of res.cylinders){
+    vctx.strokeStyle = colours[c.confidence] || '#aaa';
+    vctx.strokeRect(c.box.x0, c.box.y0, c.box.x1-c.box.x0, c.box.y1-c.box.y0);
+    if(c.tag){
+      const [tx0,ty0,tx1,ty1] = c.tag.box;
+      vctx.strokeStyle = '#fff'; vctx.lineWidth = 1;
+      vctx.strokeRect(tx0, ty0, tx1-tx0, ty1-ty0);
+      vctx.lineWidth = lw;
+      const label = c.tag.label.toUpperCase();
+      const tw = vctx.measureText(label).width + 8;
+      vctx.fillStyle = colours[c.confidence];
+      vctx.fillRect(c.box.x0, Math.max(0,c.box.y0-20), tw, 18);
+      vctx.fillStyle = '#111';
+      vctx.fillText(label, c.box.x0+4, Math.max(13, c.box.y0-6));
+    }
+  }
+}
+
+function paint(res, ms){
+  const t = res.totals, a = t.all;
+  $('cnt').firstChild.nodeValue = t.count;
+  $('tf').textContent=a.full; $('te').textContent=a.empty;
+  $('tu').textContent=a.in_use; $('tq').textContent=a.unsure;
+  const c = $('cTrust');
+  c.textContent = 'trust '+res.trust+' '+Math.round(res.rackConfidence*100)+'%';
+  c.className = 'chip '+(res.trust==='good'?'ok':res.trust==='weak'?'warn':'no');
+  const w = $('warn');
+  if(res.trust==='none' && t.count>0){
+    w.className='warn show'; w.style.background='rgba(179,64,46,.95)';
+    w.textContent='Does not look like a rack — check the boxes before trusting this';
+  } else if(res.trust==='weak' && t.count>0){
+    w.className='warn show'; w.style.background='rgba(176,116,0,.95)';
+    w.textContent='Low confidence — recalibrate or re-frame';
+  } else w.className='warn';
+  $('cRate').textContent = fpsAvg.toFixed(1)+' fps · '+ms.toFixed(0)+' ms';
+  $('cW').textContent = 'cyl '+(CFG.cylinderWidthFrac*100).toFixed(1)+'%';
+}
+
+/* ---------- two-tap calibration ----------
+   The one number the detector needs is how wide a cylinder is. Typing a
+   percentage is a guess; touching the two edges of a real bottle on the real
+   rack is a measurement, and it is the difference between boxes that sit on
+   cylinders and boxes that slice up the sky. */
+let calib=0, x1=0;
+$('calibBtn').onclick = () => {
+  calib=1; x1=0;
+  $('calib').classList.add('on');
+  $('calibMsg').textContent='Tap the LEFT edge of one cylinder';
+  $('m1').classList.remove('on'); $('m2').classList.remove('on');
+};
+$('stage').addEventListener('click', e => {
+  if(!calib) return;
+  const r = $('stage').getBoundingClientRect();
+  const x = (e.clientX-r.left)/r.width;
+  if(calib===1){
+    x1=x; calib=2;
+    $('m1').style.left=(x*100)+'%'; $('m1').classList.add('on');
+    $('calibMsg').textContent='Now tap its RIGHT edge';
+    return;
+  }
+  const frac = Math.abs(x-x1);
+  $('m2').style.left=(x*100)+'%'; $('m2').classList.add('on');
+  calib=0; $('calib').classList.remove('on');
+  if(frac<0.005 || frac>0.4){ setMsg('That span looks wrong — try again.'); return; }
+  CFG.cylinderWidthFrac = frac;
+  store.set('sc_width', frac);
+  setMsg('Calibrated: one cylinder = '+(frac*100).toFixed(1)+'% of the frame');
+  setTimeout(()=>{ $('m1').classList.remove('on'); $('m2').classList.remove('on'); }, 2500);
+});
+
+/* ---------- accuracy log ---------- */
+function drawLog(){
+  const withHand = log.filter(r => r.hand !== '' && r.hand != null);
+  if(withHand.length){
+    const exact = withHand.filter(r => +r.detected === +r.hand).length;
+    const ae = withHand.reduce((s,r)=>s+Math.abs(+r.detected-+r.hand),0);
+    const act = withHand.reduce((s,r)=>s+(+r.hand),0);
+    $('acc').innerHTML = withHand.length+' logged · <b>'+exact+'</b> exact · accuracy <b>'+
+      (act?Math.max(0,100-ae/act*100).toFixed(1):'—')+'%</b>';
+  } else $('acc').textContent = 'No hand counts logged yet.';
+  $('logTable').innerHTML =
+    '<thead><tr><th>When</th><th class="num">Det.</th><th class="num">Hand</th><th class="num">Diff</th></tr></thead><tbody>'+
+    log.slice(-12).reverse().map(r=>{
+      const d = (r.hand===''||r.hand==null) ? '—' : (+r.detected - +r.hand);
+      return '<tr><td>'+r.when+'</td><td class="num">'+r.detected+'</td><td class="num">'+
+             (r.hand||'—')+'</td><td class="num">'+d+'</td></tr>';
+    }).join('')+'</tbody>';
+}
+$('log').onclick = () => {
+  if(!lastResult){ setMsg('Start the camera first.'); return; }
+  log.push({when:new Date().toLocaleString([], {month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}),
+            detected:lastResult.totals.count, hand:$('hand').value,
+            full:lastResult.totals.all.full, empty:lastResult.totals.all.empty,
+            in_use:lastResult.totals.all.in_use, unsure:lastResult.totals.all.unsure,
+            trust:lastResult.trust, width:CFG.cylinderWidthFrac.toFixed(4)});
+  store.set('sc_log', log); $('hand').value=''; drawLog(); setMsg('Logged.');
+};
+$('csv').onclick = () => {
+  const q = x => '"'+String(x==null?'':x).replace(/"/g,'""')+'"';
+  const txt = ['when,detected,hand,full,empty,in_use,unsure,trust,cyl_width_frac']
+    .concat(log.map(r=>[r.when,r.detected,r.hand,r.full,r.empty,r.in_use,r.unsure,r.trust,r.width].map(q).join(',')))
+    .join('\n');
+  if(navigator.clipboard) navigator.clipboard.writeText(txt)
+    .then(()=>setMsg('CSV copied to the clipboard.'))
+    .catch(()=>setMsg(txt));
+  else setMsg(txt);
+};
+$('clear').onclick = () => { log=[]; store.set('sc_log',log); drawLog(); };
+
+/* Offline: cache this page so it opens with no signal at all. */
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{
+    navigator.serviceWorker.register('sw.js').then(()=>{
+      $('offline').textContent='offline ready';
+      $('offline').className='chip ok';
+    }).catch(()=>{});
+  });
+}
+drawLog();
+$('cW').textContent = 'cyl '+(CFG.cylinderWidthFrac*100).toFixed(1)+'%';
+</script>
+</body>
+</html>
