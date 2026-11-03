@@ -6,7 +6,7 @@
 /* Bump CACHE on every deploy. Cache-first means a phone will otherwise keep
    running the build it installed first, forever — and the version on the
    phone is the version at the customer site. */
-const CACHE = 'smartcount-v4-resume';
+const CACHE = 'smartcount-v5-v2live';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icon.svg'];
 
 self.addEventListener('install', e => {
