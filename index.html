@@ -602,9 +602,9 @@ function countCylinders(img, W, H){
    Why this exists: a single frame of a cluttered room will sometimes
    score as a rack. Pointed at a classroom the detector found "cylinders"
    in desk legs and window frames, lost them, found them again — a number
-   appearing and vanishing. One frame can be fooled; eight consecutive
-   frames that agree on the same cylinders in the same places cannot be,
-   because clutter is not periodic and does not hold still.
+   appearing and vanishing. One frame can be fooled; several consecutive
+   frames that agree on the same cylinders in the same places are much
+   harder to fool, because clutter is not periodic and does not hold still.
 
    So a count is never shown straight off a frame. A cylinder must be seen
    for minHits frames before it is counted, the row must be geometrically
@@ -769,8 +769,8 @@ function updateScene(res, live, moving, H){
      bandFill goes to 1.0 — measured 0.95-1.00 on every non-rack fixture
      (ceilings, rooflines, a plain classroom wall) against 0.67-0.82 on real
      and synthetic racks. Without this a plain gradient wall reported
-     EIGHTEEN cylinders at fit 1.00, which is precisely what happened in
-     class. The cost is that cylinders cropped off the top of the frame will
+     EIGHTEEN cylinders at fit 1.00 — the same shape of failure as the
+     classroom report. The cost is that cylinders cropped off the top will
      not lock either — so the UI asks for the top to be in shot, which also
      makes the shape layer more accurate. */
   const band = res.dbg.band || [0, H];
@@ -831,26 +831,59 @@ CFG.cylinderWidthFrac = store.get('sc_width', CFG.cylinderWidthFrac);
 function setMsg(t){ $('msg').textContent = t||''; }
 
 /* ---------- camera ---------- */
-$('start').onclick = async () => {
-  if(stream){ stopCam(); return; }
+let wantCamera = false;      // what the operator asked for, vs what iOS allowed
+
+async function startCam(quiet){
   try{
     stream = await navigator.mediaDevices.getUserMedia({
       video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}},
       audio:false});
   }catch(err){
+    stream = null;
     $('state').textContent='BLOCKED';
     setMsg('Camera blocked ('+err.name+'). iOS only gives the camera to a page opened over https, or to a file opened from Files.');
-    return;
+    return false;
   }
   v.srcObject = stream; await v.play();
   track = stream.getVideoTracks()[0];
+  // iOS hands the camera to whatever you switch to and never gives it back on
+  // its own. Noticing that lets us pick it up again instead of showing a
+  // frozen last frame, which would look exactly like a working camera.
+  track.addEventListener('ended', () => { if(wantCamera) resume(); });
   const s = track.getSettings();
   $('dot').classList.add('on'); $('state').textContent='LIVE';
   $('start').textContent='Stop';
-  setMsg('Camera '+(s.width||'?')+'×'+(s.height||'?')+' · all processing on this phone');
+  setMsg(quiet ? 'Camera back.'
+               : 'Camera '+(s.width||'?')+'×'+(s.height||'?')+' · all processing on this phone');
   resetTracking();
   keepAwake();
-  loop();
+  if(!timer) loop();
+  return true;
+}
+
+/* Re-acquire after the phone was locked or the app was switched away from.
+   The whole point of this build is that it survives a day in a warehouse
+   without being babysat. */
+let resuming = false;
+async function resume(){
+  if(resuming || !wantCamera) return;
+  resuming = true;
+  try{
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    stream = null; track = null;
+    await startCam(true);
+  } finally { resuming = false; }
+}
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState !== 'visible' || !wantCamera) return;
+  const dead = !stream || !track || track.readyState === 'ended';
+  if(dead) resume(); else { keepAwake(); if(!timer) loop(); }
+});
+
+$('start').onclick = async () => {
+  if(stream){ wantCamera = false; stopCam(); return; }
+  wantCamera = true;
+  if(!await startCam(false)) wantCamera = false;
 };
 function stopCam(){
   if(timer) cancelAnimationFrame(timer);
@@ -864,14 +897,17 @@ function stopCam(){
   $('start').textContent='Start camera';
 }
 $('reset').onclick = () => resetTracking('Tracking cleared — re-point at the rack.');
+/* The wake lock is dropped every time the screen sleeps, so it has to be
+   re-requested — but the listener that does so is registered ONCE. Doing it
+   inside keepAwake stacked another listener on every re-acquire, which over a
+   day in the field means dozens of them firing at once. */
 let lock=null;
 async function keepAwake(){
-  try{
-    lock = await navigator.wakeLock.request('screen');
-    document.addEventListener('visibilitychange', ()=>{
-      if(document.visibilityState==='visible' && stream) keepAwake(); });
-  }catch(e){}
+  try{ lock = await navigator.wakeLock.request('screen'); }catch(e){}
 }
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='visible' && stream) keepAwake();
+});
 
 /* Zoom gets more pixels onto the cylinders, which is the only thing that makes
    small detail detectable. Real camera zoom where the device allows it, a
@@ -1142,9 +1178,6 @@ if('serviceWorker' in navigator){
       $('offline').className='chip ok';
       r.update().catch(()=>{});
     }).catch(()=>{});
-    // A cache-first app will happily serve last week's build forever. When a
-    // new worker takes over, reload once so the phone is running the version
-    // that was actually tested.
     let swapped = false;
     navigator.serviceWorker.addEventListener('controllerchange', ()=>{
       if(swapped) return; swapped = true; location.reload();
