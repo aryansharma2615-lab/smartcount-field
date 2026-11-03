@@ -62,9 +62,13 @@ a{color:var(--accent)}
     <label class="btn primary" for="cam">📷 Snap photo<input id="cam" type="file" accept="image/*" capture="environment"></label>
     <label class="btn" for="pick">Choose photo<input id="pick" type="file" accept="image/*"></label>
   </div>
+  <div class="row">
+    <button id="live" class="primary">🔴 Live count</button>
+    <button id="freeze">Freeze to fix</button>
+  </div>
 
   <div class="stage" id="stage">
-    <canvas id="view"></canvas>
+    <canvas id="view"></canvas><video id="vid" playsinline muted autoplay style="display:none"></video>
     <div class="empty" id="empty">Snap the cylinders from above or at an angle so the <b>&nbsp;caps&nbsp;</b> show.<br>Then tap one cap.</div>
     <div class="hint" id="hint"></div>
     <div class="banner"><b id="big">–</b><small>CYLINDERS</small></div>
@@ -132,13 +136,7 @@ function dist(h,s,v,c){let dh=Math.abs(h-c.h);if(dh>180)dh=360-dh;
 function load(file){
   if(!file)return;
   const url=URL.createObjectURL(file);const im=new Image();
-  im.onload=()=>{img=im;
-    const sc=WORK/Math.max(im.naturalWidth,im.naturalHeight);
-    W=Math.round(im.naturalWidth*sc);H=Math.round(im.naturalHeight*sc);
-    work.width=W;work.height=H;wctx.drawImage(im,0,0,W,H);
-    const d=wctx.getImageData(0,0,W,H).data;const N=W*H;
-    rgb=d;hsv=new Float32Array(N*3);
-    for(let p=0,i=0;p<N;p++,i+=4){const t=toHSV(d[i],d[i+1],d[i+2]);hsv[p*3]=t[0];hsv[p*3+1]=t[1];hsv[p*3+2]=t[2]}
+  im.onload=()=>{stopLive();img=im;ingest(im,im.width,im.height,WORK);
     $('empty').style.display='none';
     // re-run any remembered colours on the new photo
     classes.forEach(c=>{c.dots=[];});
@@ -150,6 +148,49 @@ function load(file){
 }
 $('cam').onchange=e=>load(e.target.files[0]);
 $('pick').onchange=e=>load(e.target.files[0]);
+
+function ingest(src,sw,sh,size){
+  const sc=size/Math.max(sw,sh);
+  W=Math.round(sw*sc);H=Math.round(sh*sc);
+  work.width=W;work.height=H;wctx.drawImage(src,0,0,W,H);
+  const d=wctx.getImageData(0,0,W,H).data;const N=W*H;
+  rgb=d;if(!hsv||hsv.length!==N*3)hsv=new Float32Array(N*3);
+  for(let p=0,i=0;p<N;p++,i+=4){const t=toHSV(d[i],d[i+1],d[i+2]);hsv[p*3]=t[0];hsv[p*3+1]=t[1];hsv[p*3+2]=t[2]}
+}
+
+/* ---------- live camera: same engine on every frame ----------
+   Smaller working image (420 px) so it keeps ~4-8 fps on a phone; cap size is
+   stored as a share of the frame so it carries between live and photo modes. */
+const vid=$('vid'), snap=document.createElement('canvas'), sctx=snap.getContext('2d');
+let stream=null, liveOn=false, hist=[], busy=false;
+async function startLive(){
+  try{stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});}
+  catch(e){setMsg('Camera blocked ('+e.name+'). Use Snap photo instead.');return}
+  vid.srcObject=stream;await vid.play().catch(()=>{});
+  liveOn=true;hist=[];$('live').textContent='■ Stop live';$('empty').style.display='none';
+  classes.forEach(c=>{c.removed=[];c.dots=c.dots.filter(()=>false)});
+  if(!classes.length){mode='pick';hint('Point at the cylinders and tap ONE cap');}
+  tick();
+}
+function stopLive(){liveOn=false;if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}$('live').textContent='🔴 Live count';}
+function tick(){
+  if(!liveOn)return;
+  if(vid.videoWidth&&!busy){busy=true;
+    const vw=vid.videoWidth,vh=vid.videoHeight;const sc=Math.min(1,1280/Math.max(vw,vh));
+    snap.width=Math.round(vw*sc);snap.height=Math.round(vh*sc);sctx.drawImage(vid,0,0,snap.width,snap.height);
+    img=snap;ingest(snap,snap.width,snap.height,420);
+    classes.forEach((c,i)=>{c.dots=[];c.removed=[];detect(i)});
+    hist.push(classes.map(c=>c.dots.length));if(hist.length>6)hist.shift();
+    draw(true);busy=false;}
+  setTimeout(()=>requestAnimationFrame(tick),60);
+}
+$('live').onclick=()=>liveOn?stopLive():startLive();
+$('freeze').onclick=()=>{
+  if(!img){setMsg('Start live or snap a photo first.');return}
+  if(liveOn){const f=document.createElement('canvas');f.width=snap.width;f.height=snap.height;f.getContext('2d').drawImage(snap,0,0);
+    stopLive();img=f;ingest(f,f.width,f.height,WORK);classes.forEach((c,i)=>{c.dots=[];c.removed=[];detect(i)});renderClasses();
+    setMsg('Frozen. Tap Fix to add or remove, then Log.');}
+};
 
 /* ---------- pick a cap: sample colour + measure its size by region growing ---------- */
 function startPick(){if(!img){setMsg('Snap a photo first.');return}mode='pick';$('fix').setAttribute('aria-pressed','false');hint('Tap the middle of ONE cap');}
@@ -176,12 +217,12 @@ function sampleAt(x,y){
   rays.sort((p,q)=>p-q);
   let r=rays[Math.floor(rays.length*0.4)];
   r=Math.min(Math.max(r,W*0.01),W*0.09);
-  c.r=r;return c;
+  c.r=r;c.rf=r/W;return c;
 }
 
 /* ---------- detection: colour mask → close → distance transform → peaks ---------- */
 function detect(ci){
-  const c=classes[ci];const tol=+$('tol').value;const N=W*H;
+  const c=classes[ci];if(c.rf)c.r=c.rf*W;const tol=+$('tol').value;const N=W*H;
   const m=new Uint8Array(N);
   for(let p=0;p<N;p++)if(dist(hsv[p*3],hsv[p*3+1],hsv[p*3+2],c)<tol)m[p]=1;
   let mm=close(m,W,H,Math.max(1,Math.round(c.r*0.12)));
@@ -234,11 +275,12 @@ $('stage').addEventListener('click',e=>{
   const r=view.getBoundingClientRect();const x=(e.clientX-r.left)/r.width*W, y=(e.clientY-r.top)/r.height*H;
   if(mode==='pick'){
     const c=sampleAt(x,y);c.name='Colour '+(classes.length+1);c.dots=[];c.removed=[];
-    classes.push(c);sel=classes.length-1;detect(sel);mode=null;hint('');
+    classes.push(c);sel=classes.length-1;detect(sel);mode=null;hint('');hist=[];
     setMsg('Found '+classes[sel].dots.length+'. Check the dots. Tap Fix to add or remove.');
     renderClasses();draw();return;
   }
   if(mode==='fix'){
+    if(liveOn){setMsg('Freeze first, then fix.');return}
     if(sel<0){setMsg('Tap a cap colour first.');return}
     // remove nearest dot of ANY class if close; else add to selected class
     let best=null,bd=1e9,bc=-1;
@@ -257,10 +299,10 @@ function outs(){$('tolOut').textContent=$('tol').value;$('sizeOut').textContent=
 
 /* ---------- draw ---------- */
 function total(){return classes.reduce((s,c)=>s+c.dots.length,0)}
-function draw(){
+function draw(live){
   if(!img)return;
-  const sc=Math.min(1,1600/Math.max(img.naturalWidth,img.naturalHeight));
-  view.width=Math.round(img.naturalWidth*sc);view.height=Math.round(img.naturalHeight*sc);
+  const sc=Math.min(1,1600/Math.max(img.width,img.height));
+  view.width=Math.round(img.width*sc);view.height=Math.round(img.height*sc);
   ctx.drawImage(img,0,0,view.width,view.height);
   const k=view.width/W;
   let n=0;
@@ -271,7 +313,10 @@ function draw(){
       const fs=Math.max(14,r*0.9);ctx.font='700 '+fs+'px -apple-system,Arial';ctx.textAlign='center';ctx.textBaseline='middle';
       ctx.fillStyle='#000c';ctx.fillText(n,x+1.5,y+1.5);ctx.fillStyle=d.manual?'#fff':col;ctx.fillText(n,x,y);});
   });
-  $('big').textContent=classes.length?total():'–';
+  let shown=total();
+  if(live&&hist.length){shown=classes.reduce((s,c,i)=>{const v=hist.map(h=>h[i]||0).sort((a,b)=>a-b);return s+v[v.length>>1]},0);}
+  $('big').textContent=classes.length?shown:'–';
+  if(live)document.querySelectorAll('.cls .n').forEach((el,i)=>{const v=hist.map(h=>h[i]||0).sort((a,b)=>a-b);el.textContent=v.length?v[v.length>>1]:0});
 }
 function renderClasses(){
   const box=$('classes');box.innerHTML='';
@@ -312,7 +357,7 @@ function setMsg(t){$('msg').textContent=t||''}
 function hint(t){const h=$('hint');h.textContent=t;h.classList.toggle('on',!!t)}
 drawLog();
 if('serviceWorker' in navigator)navigator.serviceWorker.register('../sw.js').then(()=>{$('offline').textContent='v2 · offline ready'}).catch(()=>{});
-window.__sc={setView,get classes(){return classes},total,detect,sampleAt,get W(){return W},get H(){return H}};
+window.__sc={setView,ingest,get liveOn(){return liveOn},get classes(){return classes},total,detect,sampleAt,get W(){return W},get H(){return H}};
 })();
 </script>
 </body>
